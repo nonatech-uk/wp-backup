@@ -12,6 +12,12 @@ class YAWP_S3 {
     private $bucket;
     private $service = 's3';
 
+    // Cache of the daily SigV4 signing key — { date_short => binary key }.
+    // Signing keys are valid for the calendar day, so a single multipart
+    // upload of N parts reuses the same key instead of recomputing 4 HMACs
+    // per part.
+    private $signing_key_cache = [];
+
     const PART_SIZE = 5242880; // 5 MB (minimum for S3 multipart)
     const MULTIPART_THRESHOLD = 104857600; // 100 MB
 
@@ -532,28 +538,29 @@ class YAWP_S3 {
                 return new WP_Error( 'yawp_s3', "S3 ListObjectsV2 failed (HTTP {$code}): " . $this->parse_s3_error( $response ) );
             }
 
-            // Parse <Contents> entries.
-            if ( preg_match_all( '/<Contents>(.*?)<\/Contents>/s', $response, $matches ) ) {
-                foreach ( $matches[1] as $block ) {
-                    $key  = preg_match( '/<Key>(.+?)<\/Key>/', $block, $m ) ? $m[1] : '';
-                    $size = preg_match( '/<Size>(.+?)<\/Size>/', $block, $m ) ? (int) $m[1] : 0;
-                    $date = preg_match( '/<LastModified>(.+?)<\/LastModified>/', $block, $m ) ? $m[1] : '';
+            // Strip the default xmlns so SimpleXML's element accessors work
+            // without registerXPathNamespace gymnastics.
+            $clean = preg_replace( '/\sxmlns="[^"]+"/', '', $response, 1 );
+            $xml   = @simplexml_load_string( $clean );
+            if ( false === $xml ) {
+                return new WP_Error( 'yawp_s3', 'Could not parse ListObjectsV2 response.' );
+            }
 
-                    if ( '' !== $key ) {
-                        $all_objects[] = [
-                            'Key'          => $key,
-                            'Size'         => $size,
-                            'LastModified' => $date,
-                        ];
-                    }
+            foreach ( $xml->Contents as $c ) {
+                $key = (string) $c->Key;
+                if ( '' === $key ) {
+                    continue;
                 }
+                $all_objects[] = [
+                    'Key'          => $key,
+                    'Size'         => (int) $c->Size,
+                    'LastModified' => (string) $c->LastModified,
+                ];
             }
 
-            // Check for pagination.
-            $continuation_token = '';
-            if ( preg_match( '/<NextContinuationToken>(.+?)<\/NextContinuationToken>/', $response, $m ) ) {
-                $continuation_token = $m[1];
-            }
+            $continuation_token = isset( $xml->NextContinuationToken )
+                ? (string) $xml->NextContinuationToken
+                : '';
         } while ( '' !== $continuation_token );
 
         return $all_objects;
@@ -683,10 +690,20 @@ class YAWP_S3 {
     }
 
     private function derive_signing_key( $date_short ) {
+        if ( isset( $this->signing_key_cache[ $date_short ] ) ) {
+            return $this->signing_key_cache[ $date_short ];
+        }
         $k_date    = hash_hmac( 'sha256', $date_short, 'AWS4' . $this->secret_key, true );
         $k_region  = hash_hmac( 'sha256', $this->region, $k_date, true );
         $k_service = hash_hmac( 'sha256', $this->service, $k_region, true );
-        return hash_hmac( 'sha256', 'aws4_request', $k_service, true );
+        $key       = hash_hmac( 'sha256', 'aws4_request', $k_service, true );
+
+        // Bound the cache — even a midnight-crossing upload only needs 2.
+        if ( count( $this->signing_key_cache ) >= 2 ) {
+            $this->signing_key_cache = [];
+        }
+        $this->signing_key_cache[ $date_short ] = $key;
+        return $key;
     }
 
     // ──────────────────────────────────────────────

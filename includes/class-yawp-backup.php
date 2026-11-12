@@ -343,10 +343,16 @@ class YAWP_Backup {
         }
         $state = $this->log_state( $state, 'Database uploaded to S3.' );
 
-        // Store webroot and DB size for subsequent steps.
-        $webroot = rtrim( $this->get_webroot(), '/' );
-        if ( ! is_dir( $webroot ) ) {
-            return $this->fail_state( $state, 'Webroot does not exist: ' . $webroot );
+        // Store webroot and DB size for subsequent steps. Canonicalise via
+        // realpath so the symlink-containment check in step_scan works even
+        // when the configured webroot is itself a symlink.
+        $webroot_raw = rtrim( $this->get_webroot(), '/' );
+        if ( ! is_dir( $webroot_raw ) ) {
+            return $this->fail_state( $state, 'Webroot does not exist: ' . $webroot_raw );
+        }
+        $webroot = realpath( $webroot_raw );
+        if ( false === $webroot ) {
+            return $this->fail_state( $state, 'Cannot canonicalise webroot: ' . $webroot_raw );
         }
 
         $state['webroot']    = $webroot;
@@ -387,13 +393,23 @@ class YAWP_Backup {
         $chunk_index = 0;
         $count       = 0;
 
+        $webroot_prefix = $webroot . '/';
+        $webroot_len    = strlen( $webroot_prefix );
+
         foreach ( $iterator as $file ) {
             $real_path = $file->getRealPath();
             if ( false === $real_path ) {
                 continue;
             }
 
-            $rel_path = ltrim( substr( $real_path, strlen( $webroot ) ), '/' );
+            // Reject anything whose realpath escapes the webroot — guards
+            // against symlinks that point outside the WP tree (e.g. to
+            // /etc, ~/.aws, sibling sites on shared hosting).
+            if ( 0 !== strpos( $real_path, $webroot_prefix ) ) {
+                continue;
+            }
+
+            $rel_path = substr( $real_path, $webroot_len );
             if ( '' === $rel_path ) {
                 continue;
             }
@@ -971,9 +987,10 @@ class YAWP_Backup {
 
     /**
      * Recursively delete a directory and everything below it. Used by
-     * cleanup paths. Silently tolerates already-gone files.
+     * cleanup paths in both backup and restore. Silently tolerates
+     * already-gone files.
      */
-    private static function rrmdir( $dir ) {
+    public static function rrmdir( $dir ) {
         if ( ! is_dir( $dir ) ) {
             return;
         }
@@ -1033,9 +1050,10 @@ class YAWP_Backup {
             return new WP_Error( 'yawp_backup', 'Could not create ' . $root );
         }
         // Guard the root — web-inaccessible even before any backup runs.
+        // Covers Apache 2.2 (Order/Deny) and 2.4 (Require) syntax.
         $htaccess = $root . '/.htaccess';
         if ( ! file_exists( $htaccess ) ) {
-            @file_put_contents( $htaccess, "Order deny,allow\nDeny from all\n<IfModule mod_rewrite.c>\nRewriteEngine On\nRewriteRule .* - [F,L]\n</IfModule>\n" );
+            @file_put_contents( $htaccess, "<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\nOrder deny,allow\nDeny from all\n</IfModule>\n<IfModule mod_rewrite.c>\nRewriteEngine On\nRewriteRule .* - [F,L]\n</IfModule>\n" );
         }
         $index = $root . '/index.html';
         if ( ! file_exists( $index ) ) {
@@ -1084,15 +1102,10 @@ class YAWP_Backup {
 
     private function get_webroot() {
         $webroot = get_option( 'yawp_webroot', '' );
-        if ( empty( $webroot ) || '/var/www/html' === $webroot ) {
-            if ( defined( 'ABSPATH' ) && is_dir( ABSPATH ) ) {
-                if ( ! empty( $webroot ) && is_dir( $webroot ) ) {
-                    return $webroot;
-                }
-                return rtrim( ABSPATH, '/' );
-            }
+        if ( '' !== $webroot && is_dir( $webroot ) ) {
+            return $webroot;
         }
-        return $webroot;
+        return defined( 'ABSPATH' ) && is_dir( ABSPATH ) ? rtrim( ABSPATH, '/' ) : $webroot;
     }
 
     private function get_s3() {

@@ -102,21 +102,38 @@ class YAWP_Restore {
     public function restore( $s3_key, $new_url = '' ) {
         global $wpdb;
 
-        if ( false !== get_transient( 'yawp_restore_running' ) ) {
-            return new WP_Error( 'yawp_restore', 'A restore is already in progress.' );
+        // Atomic claim — add_option is INSERT-only at the SQL layer, so two
+        // simultaneous POSTs can't both proceed. Stale locks (process died,
+        // expiry in the past) are reclaimed by one retry.
+        $now    = time();
+        $expiry = $now + 1800;
+        $claimed = add_option( 'yawp_restore_lock', $expiry, '', false );
+        if ( ! $claimed ) {
+            $existing = (int) get_option( 'yawp_restore_lock', 0 );
+            if ( $existing > $now ) {
+                return new WP_Error( 'yawp_restore', 'A restore is already in progress.' );
+            }
+            delete_option( 'yawp_restore_lock' );
+            if ( ! add_option( 'yawp_restore_lock', $expiry, '', false ) ) {
+                return new WP_Error( 'yawp_restore', 'Could not acquire restore lock.' );
+            }
         }
+
         if ( false !== get_transient( 'yawp_backup_running' ) ) {
+            delete_option( 'yawp_restore_lock' );
             return new WP_Error( 'yawp_restore', 'A backup is currently running. Please wait for it to finish.' );
         }
-        set_transient( 'yawp_restore_running', time(), 1800 );
 
         @set_time_limit( 1800 );
         delete_option( 'yawp_restore_progress' );
 
-        $tmp_dir = sys_get_temp_dir() . '/yawp-restore-' . time() . '/';
+        // Random suffix prevents a co-tenant on a shared host from
+        // pre-creating /tmp/yawp-restore-<time>/ to race or shadow our
+        // download dir.
+        $tmp_dir = sys_get_temp_dir() . '/yawp-restore-' . time() . '-' . bin2hex( random_bytes( 8 ) ) . '/';
 
         try {
-            if ( ! mkdir( $tmp_dir, 0755, true ) ) {
+            if ( ! mkdir( $tmp_dir, 0700, true ) ) {
                 return new WP_Error( 'yawp_restore', 'Cannot create temp directory.' );
             }
 
@@ -132,7 +149,12 @@ class YAWP_Restore {
             }
 
             $webroot      = rtrim( ABSPATH, '/' );
-            $tar_excludes = "--overwrite --exclude=wp-config.php --exclude=.htaccess --exclude=wp-content/plugins/yawp --exclude=wp-content/object-cache.php --exclude='.claude' --exclude='.git'";
+            // --no-same-owner / --no-same-permissions stop a malicious archive
+            // from setting suid bits or fighting the host's umask. --no-overwrite-dir
+            // protects directory metadata. --anchored + a leading '/' refusal
+            // would be nicer still, but GNU tar already refuses absolute paths
+            // and '..' segments by default.
+            $tar_excludes = "--overwrite --no-overwrite-dir --no-same-owner --no-same-permissions --exclude=wp-config.php --exclude=.htaccess --exclude=wp-content/plugins/yawp --exclude=wp-content/object-cache.php --exclude=.claude --exclude=.git";
 
             // If incremental, build the full chain (full + incrementals).
             if ( 'incremental' === ( $manifest['type'] ?? '' ) ) {
@@ -273,8 +295,10 @@ class YAWP_Restore {
 
         } finally {
             if ( is_dir( $tmp_dir ) ) {
-                exec( 'rm -rf ' . escapeshellarg( $tmp_dir ) );
+                YAWP_Backup::rrmdir( $tmp_dir );
             }
+            delete_option( 'yawp_restore_lock' );
+            // Legacy transient — clear in case it lingers from a prior version.
             delete_transient( 'yawp_restore_running' );
         }
     }
@@ -376,6 +400,15 @@ class YAWP_Restore {
             if ( '' === $trimmed || 0 === strpos( $trimmed, '--' ) || 0 === strpos( $trimmed, '/*' ) ) {
                 continue;
             }
+            // Skip LOCK/UNLOCK TABLES — old dumps (pre-keyset-export) contain
+            // them, and many shared hosts don't grant LOCK TABLES privilege.
+            // The dump itself works fine without them; replaying them would
+            // just generate noise (and fail the restore under task-#3's
+            // strict error handling).
+            $upper = strtoupper( $trimmed );
+            if ( 0 === strpos( $upper, 'LOCK TABLES' ) || 0 === strpos( $upper, 'UNLOCK TABLES' ) ) {
+                continue;
+            }
             $buffer .= $line;
             if ( ';' === substr( $trimmed, -1 ) ) {
                 $ok = mysqli_query( $dbh, $buffer );
@@ -400,7 +433,13 @@ class YAWP_Restore {
         mysqli_close( $dbh );
 
         if ( ! empty( $errors ) ) {
-            yawp_log( 'warning', 'Restore SQL errors', [ 'count' => count( $errors ), 'sample' => $errors[0] ?? '' ] );
+            yawp_log( 'error', 'Restore SQL errors', [ 'count' => count( $errors ), 'sample' => $errors[0] ?? '' ] );
+            return new WP_Error( 'yawp_restore', sprintf(
+                'SQL import failed (%d statement%s); first error: %s',
+                count( $errors ),
+                count( $errors ) === 1 ? '' : 's',
+                $errors[0] ?? 'unknown'
+            ) );
         }
 
         return true;
@@ -458,18 +497,22 @@ class YAWP_Restore {
             }
         }
 
-        // Update option_name entries that embed the prefix (e.g. {prefix}user_roles).
-        $options_table = $table_prefix . 'options';
-        $sp_esc = mysqli_real_escape_string( $dbh, $source_prefix );
-        $tp_esc = mysqli_real_escape_string( $dbh, $table_prefix );
-        mysqli_query( $dbh,
-            "UPDATE `{$options_table}` SET `option_name` = CONCAT('{$tp_esc}', SUBSTRING(`option_name`, " . ( $sp_len + 1 ) . ")) WHERE `option_name` LIKE '{$sp_esc}%' AND `option_name` NOT LIKE '{$tp_esc}%'"
-        );
-
-        // Update usermeta meta_key entries that embed the prefix (e.g. {prefix}capabilities).
+        // Update option_name / meta_key entries that embed the prefix (e.g.
+        // {prefix}user_roles, {prefix}capabilities). Use BINARY SUBSTRING
+        // equality rather than LIKE so the underscore in 'wp_' isn't treated
+        // as a wildcard and one prefix can't shadow another (e.g. source
+        // 'wp_' vs target 'wpfoo_' — both share a prefix but mean different
+        // things).
+        $sp_esc         = mysqli_real_escape_string( $dbh, $source_prefix );
+        $tp_esc         = mysqli_real_escape_string( $dbh, $table_prefix );
+        $options_table  = $table_prefix . 'options';
         $usermeta_table = $table_prefix . 'usermeta';
+
         mysqli_query( $dbh,
-            "UPDATE `{$usermeta_table}` SET `meta_key` = CONCAT('{$tp_esc}', SUBSTRING(`meta_key`, " . ( $sp_len + 1 ) . ")) WHERE `meta_key` LIKE '{$sp_esc}%' AND `meta_key` NOT LIKE '{$tp_esc}%'"
+            "UPDATE `{$options_table}` SET `option_name` = CONCAT('{$tp_esc}', SUBSTRING(`option_name`, " . ( $sp_len + 1 ) . ")) WHERE BINARY SUBSTRING(`option_name`, 1, {$sp_len}) = '{$sp_esc}'"
+        );
+        mysqli_query( $dbh,
+            "UPDATE `{$usermeta_table}` SET `meta_key` = CONCAT('{$tp_esc}', SUBSTRING(`meta_key`, " . ( $sp_len + 1 ) . ")) WHERE BINARY SUBSTRING(`meta_key`, 1, {$sp_len}) = '{$sp_esc}'"
         );
 
         // Drop leftover source-prefixed tables (in case rename left duplicates).
@@ -544,14 +587,16 @@ class YAWP_Restore {
 
                 foreach ( $text_cols as $col ) {
                     // Check if any rows contain the old URL in this column.
+                    // EXISTS short-circuits — far cheaper than COUNT(*) on
+                    // huge tables where the URL doesn't appear at all.
                     $check = mysqli_query( $dbh,
-                        "SELECT COUNT(*) FROM `{$table}` WHERE `{$col}` LIKE '%{$old_esc}%' LIMIT 1"
+                        "SELECT EXISTS(SELECT 1 FROM `{$table}` WHERE `{$col}` LIKE '%{$old_esc}%' LIMIT 1)"
                     );
                     if ( ! $check ) {
                         continue;
                     }
-                    $count_row = mysqli_fetch_row( $check );
-                    if ( ! $count_row || 0 === (int) $count_row[0] ) {
+                    $row_exists = mysqli_fetch_row( $check );
+                    if ( ! $row_exists || 0 === (int) $row_exists[0] ) {
                         continue;
                     }
 
@@ -607,9 +652,12 @@ class YAWP_Restore {
      * If not serialized, do a plain str_replace.
      */
     private function serialized_replace( $search, $replace, $value ) {
-        // Try to unserialize.
-        $unserialized = @unserialize( $value );
-        if ( false !== $unserialized || 'b:0;' === $value ) {
+        // Try to unserialize. allowed_classes=false rejects object payloads —
+        // backup-derived data is untrusted (S3 write access = attacker control)
+        // and we don't need objects for the URL rewrite, so refuse them
+        // rather than running magic methods from arbitrary gadget chains.
+        $unserialized = @unserialize( $value, [ 'allowed_classes' => false ] );
+        if ( false !== $unserialized ) {
             $replaced = $this->walk_replace( $search, $replace, $unserialized );
             return serialize( $replaced );
         }

@@ -142,9 +142,18 @@ class YAWP_Updater {
             return false;
         }
 
+        // Pin the package URL to the GitHub host we expect. Refuses to install
+        // anything redirected to another origin even if the API response is
+        // tampered with upstream of us.
+        $zipball = $body['zipball_url'];
+        if ( ! preg_match( '#^https://(api\.github\.com|codeload\.github\.com|github\.com)/#', $zipball ) ) {
+            yawp_log( 'warning', 'GitHub release rejected — unexpected zipball host', [ 'url' => $zipball ] );
+            return false;
+        }
+
         $data = [
             'tag_name'    => $body['tag_name'],
-            'zipball_url' => $body['zipball_url'],
+            'zipball_url' => $zipball,
             'body'        => $body['body'] ?? '',
         ];
 

@@ -49,8 +49,8 @@ IAM policy needs: `s3:PutObject`, `s3:GetObject`, `s3:ListBucket`, `s3:AbortMult
 1. **Activation** — schedules a daily WP-Cron event at 03:00 UTC
 2. **Login hook** — any `wp_login` sets a date flag in `wp_options`
 3. **Daily check** — if no full backup exists, runs full; if login flag is set, runs incremental; otherwise skips
-4. **Backup** — exports DB via `$wpdb`, creates tar.gz, uploads to S3 with Object Lock headers
-5. **Incremental** — uses `tar --newer` to include only files changed since last backup (always includes full DB)
+4. **Backup** — exports DB (gzipped), streams files into chunked tar.gz parts on disk, uploads each part to S3 with Object Lock headers, writes a manifest
+5. **Incremental** — scanner filters files by mtime against `yawp_last_backup_time` so only changed files end up in archive parts (DB is always dumped in full)
 
 ## License
 

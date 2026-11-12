@@ -68,31 +68,51 @@ class YAWP_DB_Export {
         fwrite( $fh, "DROP TABLE IF EXISTS `{$table}`;\n" );
         fwrite( $fh, $create[1] . ";\n\n" );
 
-        // Data in batches.
-        fwrite( $fh, "LOCK TABLES `{$table}` WRITE;\n" );
+        // Find a single-column primary key for keyset pagination.
+        // Without it LIMIT/OFFSET pagination is O(n²) on large tables —
+        // exporting a million-row wp_postmeta would take quadratic time.
+        $pk_col = $this->find_keyset_column( $dbh, $table );
 
-        $offset  = 0;
-        $batch   = 100;
-        $columns = null;
+        $batch         = $pk_col ? 1000 : 100;
+        $columns       = null;
+        $pk_index      = -1;
+        $last_pk       = null;
+        $offset        = 0;
+        $max_stmt_size = 1048576; // 1 MB per INSERT statement.
 
         while ( true ) {
-            $result = mysqli_query( $dbh, "SELECT * FROM `{$table}` LIMIT {$batch} OFFSET {$offset}" );
+            if ( $pk_col ) {
+                $where = ( null === $last_pk )
+                    ? ''
+                    : "WHERE `{$pk_col}` > '" . mysqli_real_escape_string( $dbh, $last_pk ) . "'";
+                $sql = "SELECT * FROM `{$table}` {$where} ORDER BY `{$pk_col}` LIMIT {$batch}";
+            } else {
+                $sql = "SELECT * FROM `{$table}` LIMIT {$batch} OFFSET {$offset}";
+            }
+
+            $result = mysqli_query( $dbh, $sql );
             if ( ! $result || 0 === mysqli_num_rows( $result ) ) {
+                if ( $result ) {
+                    mysqli_free_result( $result );
+                }
                 break;
             }
 
-            // Get column names once.
+            // Get column names + PK column index once per table.
             if ( null === $columns ) {
                 $fields  = mysqli_fetch_fields( $result );
-                $columns = array_map( function ( $f ) {
-                    return '`' . $f->name . '`';
-                }, $fields );
+                $columns = [];
+                foreach ( $fields as $i => $f ) {
+                    $columns[] = '`' . $f->name . '`';
+                    if ( $pk_col && $f->name === $pk_col ) {
+                        $pk_index = $i;
+                    }
+                }
             }
 
             $insert_prefix = 'INSERT INTO `' . $table . '` (' . implode( ',', $columns ) . ') VALUES ';
             $values        = [];
             $stmt_size     = strlen( $insert_prefix );
-            $max_stmt_size = 1048576; // 1 MB per statement.
 
             while ( $row = mysqli_fetch_row( $result ) ) {
                 $escaped = array_map( function ( $val ) use ( $dbh ) {
@@ -101,8 +121,8 @@ class YAWP_DB_Export {
                     }
                     return "'" . mysqli_real_escape_string( $dbh, $val ) . "'";
                 }, $row );
-                $row_str   = '(' . implode( ',', $escaped ) . ')';
-                $row_size  = strlen( $row_str ) + 2; // comma + newline.
+                $row_str  = '(' . implode( ',', $escaped ) . ')';
+                $row_size = strlen( $row_str ) + 2; // comma + newline.
 
                 // Flush if adding this row would exceed the limit.
                 if ( ! empty( $values ) && ( $stmt_size + $row_size ) > $max_stmt_size ) {
@@ -113,19 +133,47 @@ class YAWP_DB_Export {
 
                 $values[]   = $row_str;
                 $stmt_size += $row_size;
+
+                if ( $pk_index >= 0 ) {
+                    $last_pk = $row[ $pk_index ];
+                }
             }
 
             if ( ! empty( $values ) ) {
                 fwrite( $fh, $insert_prefix . "\n" . implode( ",\n", $values ) . ";\n" );
             }
 
+            $rows_read = mysqli_num_rows( $result );
             mysqli_free_result( $result );
-            $offset += $batch;
+
+            // Stop when we got fewer rows than the batch size — no more pages.
+            if ( $rows_read < $batch ) {
+                break;
+            }
+            if ( ! $pk_col ) {
+                $offset += $batch;
+            }
         }
 
-        fwrite( $fh, "UNLOCK TABLES;\n\n" );
-
+        fwrite( $fh, "\n" );
         return true;
+    }
+
+    /**
+     * Return the name of a single-column primary key suitable for keyset
+     * pagination, or null if the table has no PK (or has a composite PK).
+     */
+    private function find_keyset_column( $dbh, $table ) {
+        $result = mysqli_query( $dbh, "SHOW KEYS FROM `{$table}` WHERE Key_name = 'PRIMARY'" );
+        if ( ! $result ) {
+            return null;
+        }
+        $cols = [];
+        while ( $row = mysqli_fetch_assoc( $result ) ) {
+            $cols[] = $row['Column_name'];
+        }
+        mysqli_free_result( $result );
+        return ( 1 === count( $cols ) ) ? $cols[0] : null;
     }
 
     private function get_raw_dbh() {

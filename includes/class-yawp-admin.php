@@ -151,7 +151,10 @@ class YAWP_Admin {
             wp_send_json_error( 'Unauthorized.' );
         }
 
-        $type   = isset( $_POST['backup_type'] ) ? sanitize_text_field( $_POST['backup_type'] ) : 'full';
+        $type = isset( $_POST['backup_type'] ) ? sanitize_text_field( $_POST['backup_type'] ) : '';
+        if ( ! in_array( $type, [ 'full', 'incremental' ], true ) ) {
+            wp_send_json_error( 'Invalid backup type.' );
+        }
         $backup = new YAWP_Backup();
         $result = ( 'incremental' === $type ) ? $backup->run_incremental() : $backup->run_full();
 
@@ -173,14 +176,19 @@ class YAWP_Admin {
         // no emergency reserve is needed.
         register_shutdown_function( function () {
             $error = error_get_last();
-            if ( $error && in_array( $error['type'], [ E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR ], true ) ) {
-                if ( ! headers_sent() ) {
-                    header( 'Content-Type: application/json; charset=UTF-8' );
-                }
-                $msg = 'PHP fatal during backup step: ' . $error['message'];
-                update_option( 'yawp_last_error', $msg, false );
-                echo wp_json_encode( [ 'success' => false, 'data' => $msg ] );
+            if ( ! $error || ! in_array( $error['type'], [ E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR ], true ) ) {
+                return;
             }
+            $msg = 'PHP fatal during backup step: ' . $error['message'];
+            update_option( 'yawp_last_error', $msg, false );
+            // If a response (or anything else) already started writing,
+            // don't garble it — the UI's next poll will surface the error
+            // via yawp_last_error.
+            if ( headers_sent() ) {
+                return;
+            }
+            header( 'Content-Type: application/json; charset=UTF-8' );
+            echo wp_json_encode( [ 'success' => false, 'data' => $msg ] );
         } );
 
         $status = YAWP_Backup::get_status();
@@ -203,6 +211,7 @@ class YAWP_Admin {
             wp_send_json_error( 'Unauthorized.' );
         }
         YAWP_Backup::cancel();
+        delete_option( 'yawp_restore_lock' );
         delete_transient( 'yawp_restore_running' );
         wp_send_json_success( 'Lock cleared.' );
     }
@@ -423,10 +432,11 @@ class YAWP_Admin {
                 </thead>
                 <tbody>
                     <?php foreach ( $history as $entry ) : ?>
+                    <?php $entry_size = isset( $entry['size'] ) ? (int) $entry['size'] : 0; ?>
                     <tr class="<?php echo 'error' === $entry['type'] ? 'yawp-row-error' : ''; ?>">
                         <td><?php echo esc_html( $entry['date'] ); ?></td>
                         <td><?php echo esc_html( $entry['type'] ); ?></td>
-                        <td><?php echo $entry['size'] ? esc_html( size_format( $entry['size'] ) ) : '—'; ?></td>
+                        <td><?php echo $entry_size > 0 ? esc_html( size_format( $entry_size ) ) : '—'; ?></td>
                         <td><code><?php echo esc_html( $entry['s3_key'] ); ?></code></td>
                         <td><?php echo esc_html( $entry['status'] ); ?></td>
                     </tr>
