@@ -198,7 +198,7 @@ class YAWP_Admin {
         // and is unreliable on restricted shared hosting.
         if ( ! empty( $status['running'] ) ) {
             $backup = new YAWP_Backup();
-            $backup->process_step();
+            $backup->process_step( YAWP_Backup::STEP_BUDGET_POLL );
             // Re-read status after the step executed.
             $status = YAWP_Backup::get_status();
         }

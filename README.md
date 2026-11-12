@@ -51,6 +51,15 @@ IAM policy needs: `s3:PutObject`, `s3:GetObject`, `s3:ListBucket`, `s3:AbortMult
 3. **Daily check** — if no full backup exists, runs full; if login flag is set, runs incremental; otherwise skips
 4. **Backup** — exports DB (gzipped), streams files into chunked tar.gz parts on disk, uploads each part to S3 with Object Lock headers, writes a manifest
 5. **Incremental** — scanner filters files by mtime against `yawp_last_backup_time` so only changed files end up in archive parts (DB is always dumped in full)
+6. **Step pacing** — each cron run keeps executing steps for a time budget (240 s from CLI cron, 50 s from web cron, 10 s from the admin status poll), guarded by an atomic lock so overlapping runs never touch the same state
+
+### Hosts with `DISABLE_WP_CRON`
+
+Managed hosts (IONOS and others) often disable WP-Cron and run it themselves every ~15 minutes, which makes `spawn_cron()` a no-op. Backups still complete, but each tick only gets one budget's worth of work. Where you have SSH, add a system cron to drive it every minute:
+
+```
+* * * * * cd ~/path/to/wordpress && wp cron event run --due-now >/dev/null 2>&1
+```
 
 ## License
 

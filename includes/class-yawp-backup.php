@@ -38,6 +38,11 @@ class YAWP_Backup {
     const BATCH_SIZE       = 250;       // files per archive step — bounds worst-case part-size overshoot to ~one batch
     const TARGET_PART_SIZE = 268435456; // 256 MB — close and upload a part when staged fragments exceed this
     const FREAD_CHUNK      = 65536;     // 64 KB per fread when streaming a file into gzip
+    const STEP_LOCK_KEY    = 'yawp_step_lock';
+    const STEP_LOCK_GRACE  = 600;       // lock outlives the budget by this much — covers a part upload that starts late
+    const STEP_BUDGET_CLI  = 240;       // seconds of steps per CLI cron run
+    const STEP_BUDGET_WEB  = 50;        // seconds of steps per web-triggered cron run
+    const STEP_BUDGET_POLL = 10;        // seconds per admin status poll — keeps the settings page responsive
 
     /**
      * Directories/files to exclude from backups (relative to webroot).
@@ -139,6 +144,7 @@ class YAWP_Backup {
             }
         }
         delete_option( self::STATE_KEY );
+        delete_option( self::STEP_LOCK_KEY );
         self::delete_file_list_chunks();
         delete_transient( self::LOCK_KEY );
         wp_clear_scheduled_hook( self::CRON_HOOK );
@@ -208,9 +214,21 @@ class YAWP_Backup {
 
     /**
      * Called by WP-Cron or directly from the status poll AJAX.
-     * Reads state, executes current step, saves state.
+     *
+     * Runs as many steps as fit in a time budget rather than one step per
+     * invocation. On hosts with DISABLE_WP_CRON (IONOS, many managed hosts)
+     * spawn_cron() is a no-op, so the only driver is the host's cron tick —
+     * often every 15 minutes. One 250-file batch per tick turned a ~1 minute
+     * job into a ~40 hour one.
+     *
+     * An atomic option lock stops cron and the AJAX poll (or two overlapping
+     * cron runs) from executing steps on the same state concurrently.
+     *
+     * @param int|null $budget Seconds to keep starting new steps. Null picks
+     *                         a default for the current SAPI. A step that has
+     *                         started always runs to completion.
      */
-    public function process_step() {
+    public function process_step( $budget = null ) {
         $state = $this->load_state();
         if ( ! $state ) {
             return; // No backup in progress.
@@ -222,42 +240,107 @@ class YAWP_Backup {
             return;
         }
 
-        if ( function_exists( 'set_time_limit' ) ) {
-            @set_time_limit( 120 );
+        $budget = $this->step_budget( $budget );
+
+        if ( ! $this->acquire_step_lock( $budget + self::STEP_LOCK_GRACE ) ) {
+            return; // Another process is already working on this backup.
         }
 
+        if ( function_exists( 'set_time_limit' ) ) {
+            @set_time_limit( $budget + 120 );
+        }
+
+        $started = microtime( true );
+
+        try {
+            do {
+                $state = $this->run_one_step( $state );
+
+                // Stop if the backup was cancelled while this step ran —
+                // saving now would resurrect the deleted state.
+                $current = $this->load_state();
+                if ( ! $current || ( $current['timestamp'] ?? '' ) !== ( $state['timestamp'] ?? '' ) ) {
+                    return;
+                }
+
+                $this->save_state( $state );
+
+                if ( in_array( $state['step'], [ 'done', 'error' ], true ) ) {
+                    return;
+                }
+            } while ( ( microtime( true ) - $started ) < $budget );
+
+            // Out of budget with work remaining — queue the next run.
+            wp_schedule_single_event( time() + 1, self::CRON_HOOK );
+            spawn_cron();
+        } finally {
+            $this->release_step_lock();
+        }
+    }
+
+    /**
+     * Execute the current step once and return the new state.
+     */
+    private function run_one_step( $state ) {
         try {
             switch ( $state['step'] ) {
                 case 'init':
-                    $state = $this->step_init( $state );
-                    break;
+                    return $this->step_init( $state );
                 case 'scan':
-                    $state = $this->step_scan( $state );
-                    break;
+                    return $this->step_scan( $state );
                 case 'archive':
-                    $state = $this->step_archive( $state );
-                    break;
+                    return $this->step_archive( $state );
                 case 'close_part':
-                    $state = $this->step_close_part( $state );
-                    break;
+                    return $this->step_close_part( $state );
                 case 'finish':
-                    $state = $this->step_finish( $state );
-                    break;
+                    return $this->step_finish( $state );
                 default:
-                    $state = $this->fail_state( $state, 'Unknown step: ' . $state['step'] );
-                    break;
+                    return $this->fail_state( $state, 'Unknown step: ' . $state['step'] );
             }
         } catch ( \Throwable $e ) {
-            $state = $this->fail_state( $state, 'Exception: ' . $e->getMessage() );
+            return $this->fail_state( $state, 'Exception: ' . $e->getMessage() );
         }
+    }
 
-        $this->save_state( $state );
-
-        // Schedule next step as fallback for unattended cron runs.
-        if ( ! in_array( $state['step'], [ 'done', 'error' ], true ) ) {
-            wp_schedule_single_event( time() + 1, self::CRON_HOOK );
-            spawn_cron();
+    /**
+     * Resolve the time budget: CLI cron (no execution limit) gets the most,
+     * web requests stay well inside typical max_execution_time values.
+     */
+    private function step_budget( $budget ) {
+        if ( null === $budget ) {
+            $budget = ( 'cli' === PHP_SAPI ) ? self::STEP_BUDGET_CLI : self::STEP_BUDGET_WEB;
         }
+        $budget = max( 0, (int) $budget );
+
+        $max_exec = (int) ini_get( 'max_execution_time' );
+        if ( $max_exec > 0 && 'cli' !== PHP_SAPI ) {
+            // set_time_limit() may be disabled, so leave headroom under the
+            // limit we were given for the step that starts last.
+            $budget = min( $budget, max( 0, $max_exec - 30 ) );
+        }
+        return $budget;
+    }
+
+    /**
+     * Atomic claim — add_option is INSERT-only at the SQL layer, so only one
+     * caller wins. A lock whose expiry has passed (process died mid-step) is
+     * reclaimed once.
+     */
+    private function acquire_step_lock( $ttl ) {
+        $expiry = time() + $ttl;
+        if ( add_option( self::STEP_LOCK_KEY, $expiry, '', false ) ) {
+            return true;
+        }
+        $existing = (int) get_option( self::STEP_LOCK_KEY, 0 );
+        if ( $existing > time() ) {
+            return false;
+        }
+        delete_option( self::STEP_LOCK_KEY );
+        return add_option( self::STEP_LOCK_KEY, $expiry, '', false );
+    }
+
+    private function release_step_lock() {
+        delete_option( self::STEP_LOCK_KEY );
     }
 
     // ──────────────────────────────────────────────
