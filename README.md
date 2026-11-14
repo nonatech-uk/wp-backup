@@ -23,7 +23,7 @@ Incremental S3 backups with Object Lock for WordPress sites running in container
 
 ```bash
 cd /path/to/wp-content/plugins/
-git clone git@github.com:nonatech-uk/yawp.git
+git clone git@github.com:nonatech-uk/wp-backup.git
 ```
 
 Activate in WordPress admin, then configure under **Settings → YAWP Backup**.

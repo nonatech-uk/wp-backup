@@ -1255,7 +1255,7 @@ YAWP Backup Repository
 =======================
 
 This bucket contains WordPress backups created by the YAWP plugin.
-https://github.com/nonatech-uk/yawp
+https://github.com/nonatech-uk/wp-backup
 
 Source site: {$siteurl}
 Created:     {$date}

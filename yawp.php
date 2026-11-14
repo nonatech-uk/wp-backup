@@ -1,12 +1,12 @@
 <?php
 /**
  * Plugin Name: YAWP
- * Plugin URI: https://github.com/nonatech-uk/yawp
+ * Plugin URI: https://github.com/nonatech-uk/wp-backup
  * Description: Yet Another WordPress (Backup) Plugin — incremental S3 backups.
- * Version: 1.17.0
+ * Version: 1.17.1
  * Author: Nonatech UK
  * License: GPLv2 or later
- * Update URI: https://github.com/nonatech-uk/yawp
+ * Update URI: https://github.com/nonatech-uk/wp-backup
  * Requires PHP: 7.4
  */
 
@@ -14,10 +14,10 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'YAWP_VERSION', '1.17.0' );
+define( 'YAWP_VERSION', '1.17.1' );
 define( 'YAWP_PATH', plugin_dir_path( __FILE__ ) );
 define( 'YAWP_URL', plugin_dir_url( __FILE__ ) );
-define( 'YAWP_GITHUB_REPO', 'nonatech-uk/yawp' );
+define( 'YAWP_GITHUB_REPO', 'nonatech-uk/wp-backup' );
 
 require_once YAWP_PATH . 'includes/class-yawp-s3.php';
 require_once YAWP_PATH . 'includes/class-yawp-db-export.php';
